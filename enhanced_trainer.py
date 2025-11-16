@@ -1,20 +1,17 @@
 #!/usr/bin/env python3
 """
-Enhanced Stockfish trainer with phased training and improved debugging.
+Speed-optimized Enhanced Stockfish Trainer (full refactor for fast Phase C + GPU-first).
 
-Improvements applied:
-- Three-phase training per cycle: (A) vs Stockfish, (B) self-play, (C) vs initial (first) snapshot
-- Saves an explicit "initial" snapshot on startup and always evaluates against it (not the previous checkpoint)
-- CLI flags for --sf-games, --selfplay-games, --first-vs-games and --mcts-debug
-- Extensive debug prints: Stockfish CP/scale, MCTS root value + top moves/priors/visits, selected moves, rollout values
-- Always can print moves after each game in the compact "White: ...\nBlack: ..." format (--show-moves)
-- Phase-balanced replay buffer remains; training uses combined TD/Stockfish/final targets
-
-Notes:
-- This script assumes network_architecture.ChessNetwork, board_state.board_to_tensor, MCTSAlgorithm.MCTS exist and are compatible.
-- Tune the many hyper-parameters (simulations, batch size, LR) to your environment.
+Improvements:
+ - Cached initial snapshot net
+ - Snapshot side uses fewer simulations by default (configurable)
+ - torch.no_grad() and eval() used for all evaluations
+ - eval_batch_size passed to MCTS; increase for better GPU utilization
+ - Fast-eval mode (silence IO) for Phase C
+ - Optional parallel evaluation (use cautiously with GPU)
+ - CLI flags for controlling snapshot sims, fast-eval, and parallel eval workers
+ - Defaults tuned for GPU use
 """
-
 import argparse
 import time
 import random
@@ -22,6 +19,8 @@ import shutil
 from pathlib import Path
 from collections import deque, defaultdict
 from datetime import datetime
+import multiprocessing as mp
+import sys
 
 import numpy as np
 import torch
@@ -41,10 +40,8 @@ from config import MODEL_PATH
 # -------------------------
 
 def init_stockfish(path, skill_level=1, threads=None):
-    """Start Stockfish engine (returns None on failure)."""
     try:
         engine = chess.engine.SimpleEngine.popen_uci(path)
-        # Configure a few common options, ignore if engine/version doesn't support them
         cfg = {}
         try:
             cfg["Skill Level"] = int(skill_level)
@@ -55,9 +52,8 @@ def init_stockfish(path, skill_level=1, threads=None):
         except Exception:
             pass
         try:
-            # map skill_level to an approximate elo if user desires
             requested_elo = 800 + (int(skill_level) * 100)
-            requested_elo = max(requested_elo, 800)
+            requested_elo = max(800, requested_elo)
             cfg["UCI_Elo"] = int(requested_elo)
         except Exception:
             pass
@@ -66,51 +62,39 @@ def init_stockfish(path, skill_level=1, threads=None):
                 cfg["Threads"] = int(threads)
             except Exception:
                 pass
-        # apply
         if cfg:
             try:
                 engine.configure(cfg)
             except Exception:
-                # Some stockfish builds restrict options at runtime
                 pass
         return engine
     except Exception as e:
         print(f"⚠ Could not start Stockfish at '{path}': {e}")
         return None
 
-
 def classify_game_phase(board: chess.Board) -> str:
-    """Heuristic to classify game phase.
-    Keep it intentionally simple and tunable.
-    """
     move_count = board.fullmove_number
     piece_count = len(board.piece_map())
-
     if move_count <= 10:
         return "opening"
     if piece_count <= 10:
         return "endgame"
     return "midgame"
 
-
 def generate_varied_starting_position(stockfish_engine, phase="random", max_attempts=20):
-    """Create a varied starting board for a specific phase.
-    If stockfish_engine is None the function falls back to random legal play.
-    """
     for _ in range(max_attempts):
         board = chess.Board()
+        ph = phase
         if phase == "random":
-            phase = random.choice(["opening", "midgame", "endgame"])  # pick once per attempt
-
+            ph = random.choice(["opening", "midgame", "endgame"])
         try:
-            if phase == "opening":
+            if ph == "opening":
                 moves = random.randint(3, 8)
                 for _ in range(moves):
                     if board.is_game_over():
                         break
                     board.push(random.choice(list(board.legal_moves)))
-
-            elif phase == "midgame":
+            elif ph == "midgame":
                 moves = random.randint(12, 20)
                 for _ in range(moves):
                     if board.is_game_over():
@@ -120,9 +104,7 @@ def generate_varied_starting_position(stockfish_engine, phase="random", max_atte
                         board.push(res.move)
                     else:
                         board.push(random.choice(list(board.legal_moves)))
-
-            elif phase == "endgame":
-                # play until <= 10 pieces or reach max plies
+            elif ph == "endgame":
                 for _ in range(40):
                     if board.is_game_over() or len(board.piece_map()) <= 10:
                         break
@@ -131,25 +113,23 @@ def generate_varied_starting_position(stockfish_engine, phase="random", max_atte
                         board.push(res.move)
                     else:
                         board.push(random.choice(list(board.legal_moves)))
-
             if not board.is_game_over():
                 return board
         except Exception:
             continue
-
-    # fallback: return starting position
     return chess.Board()
-
 
 # -------------------------
 # Trainer
 # -------------------------
 class EnhancedStockfishTrainer:
     def __init__(self,
-                 stockfish_path="dist/stockfish.exe",
+                 stockfish_path="dist/stockfish-ubuntu-x86-64-avx2",
                  buffer_size=50000,
                  batch_size=128,
-                 num_simulations=100,
+                 num_simulations=128,
+                 snapshot_sim_fraction=0.25,
+                 snapshot_min_sims=8,
                  learning_rate=3e-4,
                  device=None,
                  checkpoint_dir="checkpoints",
@@ -160,28 +140,35 @@ class EnhancedStockfishTrainer:
                  pgn_dir="games",
                  self_games_per_cycle=0,
                  mcts_debug=False,
-                 stockfish_threads=None):
-
+                 stockfish_threads=None,
+                 eval_batch_size=None,
+                 fast_eval=False,
+                 parallel_eval_workers=0):
+        # device
         self.device = device if device else (torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu"))
         print(f"🔧 Device: {self.device}")
 
         self.is_cpu = self.device.type == 'cpu'
         if self.is_cpu:
-            print("⚠️  CPU detected - applying performance optimizations")
+            print("⚠️  CPU detected - performance will be lower")
 
         if torch_threads:
             torch.set_num_threads(int(torch_threads))
             print(f"🔧 Torch threads set to {torch_threads}")
 
+        # dirs
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(exist_ok=True, parents=True)
+        self.pgn_dir = Path(pgn_dir)
+        if save_pgns:
+            self.pgn_dir.mkdir(parents=True, exist_ok=True)
 
-        # network
+        # network + optimizer
         self.network = ChessNetwork().to(self.device)
         if hasattr(self.network, "enable_fast_inference"):
             try:
                 self.network.enable_fast_inference()
-                print("⚡ Fast inference mode enabled")
+                print("⚡ Fast inference mode enabled on network")
             except Exception:
                 pass
 
@@ -200,23 +187,27 @@ class EnhancedStockfishTrainer:
         else:
             self.replay_buffer = deque(maxlen=buffer_size)
 
+        # training / mcts params
         self.batch_size = batch_size
         self.num_simulations = int(num_simulations)
-        self.mcts_eval_batch = min(32, max(4, int(max(1, self.num_simulations // 4))))
+        self.snapshot_sim_fraction = float(snapshot_sim_fraction)
+        self.snapshot_min_sims = int(snapshot_min_sims)
 
+        self.mcts_eval_batch = eval_batch_size if eval_batch_size else min(128, max(8, int(max(1, self.num_simulations // 4))))
+        self.eval_batch_size = self.mcts_eval_batch
+
+        # stockfish
         self.stockfish_path = stockfish_path
         self.stockfish_threads = stockfish_threads
         self.stockfish_engine = None
 
+        # misc flags
         self.show_moves = show_moves
         self.save_pgns = save_pgns
-        self.pgn_dir = Path(pgn_dir)
-        if self.save_pgns:
-            self.pgn_dir.mkdir(parents=True, exist_ok=True)
-
         self.self_games_per_cycle = int(self_games_per_cycle)
         self.mcts_debug = bool(mcts_debug)
 
+        # bookkeeping
         self.iteration = 0
         self.stats = {
             "start_time": time.time(),
@@ -227,11 +218,14 @@ class EnhancedStockfishTrainer:
             "phase_distribution": defaultdict(int)
         }
 
-        # initial snapshot for first-version fights
+        # initial snapshot path & in-memory snapshot net
         self.initial_snapshot_path = self.checkpoint_dir / "snapshot_initial.pth"
+        self.initial_snapshot_net = None
 
+        # load main model if present
         self._load_latest_model_if_exists()
-        # create initial snapshot if missing
+
+        # create initial snapshot if missing (persist and also create in-memory copy)
         try:
             if not self.initial_snapshot_path.exists():
                 if Path(MODEL_PATH).exists():
@@ -242,8 +236,29 @@ class EnhancedStockfishTrainer:
         except Exception as e:
             print(f"⚠ Failed saving initial snapshot: {e}")
 
+        # attempt to load snapshot into memory
+        try:
+            if self.initial_snapshot_path.exists():
+                snap_net = ChessNetwork().to(self.device)
+                sd = torch.load(self.initial_snapshot_path, map_location=self.device)
+                snap_net.load_state_dict(sd)
+                snap_net.eval()
+                for p in snap_net.parameters():
+                    p.requires_grad = False
+                self.initial_snapshot_net = snap_net
+                print("✓ Loaded initial snapshot into memory (cached).")
+        except Exception as e:
+            print(f"⚠ Could not load initial snapshot network into memory: {e}")
+            self.initial_snapshot_net = None
+
+        # fast eval / parallel options
+        self.fast_eval = bool(fast_eval)
+        self.parallel_eval_workers = int(parallel_eval_workers) if parallel_eval_workers else 0
+        if self.parallel_eval_workers > 0:
+            print(f"⚠ Parallel eval workers requested: {self.parallel_eval_workers}. Use with caution on GPU.")
+
     # -------------------------
-    # IO Helpers
+    # IO / small helpers
     # -------------------------
     def _save_pgn_from_board(self, board: chess.Board, result: str, filename: Path):
         game = chess.pgn.Game()
@@ -254,8 +269,8 @@ class EnhancedStockfishTrainer:
         with open(filename, "w") as f:
             exporter = chess.pgn.FileExporter(f)
             game.accept(exporter)
+
     def moves_one_line(self, board: chess.Board) -> str:
-        """Return single string with 'White: ...\\nBlack: ...' for the given board."""
         temp = chess.Board()
         white_moves = []
         black_moves = []
@@ -274,29 +289,11 @@ class EnhancedStockfishTrainer:
         return white_line + "\n" + black_line
 
     def _print_moves_from_board(self, board: chess.Board):
-        temp = chess.Board()
-        white_moves = []
-        black_moves = []
-
-        for mv in board.move_stack:
-            try:
-                san = temp.san(mv)
-            except Exception:
-                san = mv.uci()
-            if temp.turn == chess.WHITE:
-                white_moves.append(san)
-            else:
-                black_moves.append(san)
-            temp.push(mv)
-
-        white_line = "White: " + (" ".join(white_moves) if white_moves else "(no moves)")
-        black_line = "Black: " + (" ".join(black_moves) if black_moves else "(no moves)")
-
-        print(white_line)
-        print(black_line)
+        print(self.moves_one_line(board))
 
     # -------------------------
     # Play a single game vs Stockfish
+    # (unchanged but wrapped with eval/no_grad where network is used)
     # -------------------------
     def play_game_vs_stockfish(self, bot_is_white=True, stockfish_time_limit=0.1, starting_board=None, show_debug=False):
         board = starting_board.copy() if starting_board else chess.Board()
@@ -305,7 +302,7 @@ class EnhancedStockfishTrainer:
         move_count = 0
 
         mcts = MCTS(self.network, num_simulations=self.num_simulations,
-                    device=self.device, eval_batch_size=self.mcts_eval_batch, debug=self.mcts_debug)
+                    device=self.device, eval_batch_size=self.eval_batch_size, debug=self.mcts_debug)
 
         while not board.is_game_over() and move_count < max_moves:
             is_bot_turn = (board.turn == chess.WHITE) == bot_is_white
@@ -317,7 +314,6 @@ class EnhancedStockfishTrainer:
                 try:
                     info = self.stockfish_engine.analyse(board, chess.engine.Limit(time=0.02))
                     score = info.get("score")
-                    # unify possibly mate/centipawn types
                     cp = score.white().score(mate_score=100000)
                     stockfish_score = max(min(cp / 1000.0, 1.0), -1.0)
                     if show_debug or self.show_moves:
@@ -328,7 +324,9 @@ class EnhancedStockfishTrainer:
                         print(f"[DEBUG] Stockfish analyse failed: {e}")
 
             if is_bot_turn:
-                res = mcts.search(board)
+                # ensure no grad during search calls
+                with torch.no_grad():
+                    res = mcts.search(board)
                 if isinstance(res, tuple):
                     root, selected_move = res
                 else:
@@ -342,7 +340,7 @@ class EnhancedStockfishTrainer:
                             child = MCTSNode(board.copy(), parent=root, move=m, prior_prob=1.0/len(legal))
                             root.children[m] = child
 
-                # print debug/tracing for the MCTS root
+                # debug
                 if show_debug or self.show_moves:
                     try:
                         top = sorted(root.children.items(), key=lambda kv: kv[1].visit_count, reverse=True)[:8]
@@ -351,7 +349,7 @@ class EnhancedStockfishTrainer:
                     except Exception:
                         print(f"[DEBUG] MCTS root value={root.value():.4f}")
 
-                # compute move_probs (for training) based on visit counts
+                # build move_probs for training
                 move_probs = np.zeros(4096, dtype=np.float32)
                 total_visits = sum(child.visit_count for child in root.children.values())
                 if total_visits > 0:
@@ -377,7 +375,6 @@ class EnhancedStockfishTrainer:
                     "td_target": None
                 })
 
-                # selected_move debug
                 if show_debug or self.show_moves:
                     try:
                         print(f"[DEBUG] Bot selects: {board.san(selected_move)}")
@@ -390,8 +387,6 @@ class EnhancedStockfishTrainer:
                     selected_move = res.move
                     if show_debug:
                         try:
-                            print(f"Show Bug: {show_debug}")
-                            print(f"Show_Moves: {self.show_moves}")
                             print(f"[DEBUG] Stockfish plays: {board.san(selected_move)}")
                         except Exception:
                             print(f"[DEBUG] Stockfish plays (uci): {selected_move}")
@@ -402,7 +397,7 @@ class EnhancedStockfishTrainer:
             board.push(selected_move)
             move_count += 1
 
-        # final outcome assignment
+        # assign final outcomes & compute TD targets
         result = board.result()
         for pos in game_positions:
             if result == "1-0":
@@ -412,58 +407,57 @@ class EnhancedStockfishTrainer:
             else:
                 pos["final_outcome"] = 0.0
 
-        # compute TD targets
         gamma = 0.99
         next_value = 0.0
         for pos in reversed(game_positions):
             next_value = pos["final_outcome"] * 0.5 + 0.5 * pos["mcts_value"]
             pos["td_target"] = gamma * next_value + (1 - gamma) * pos.get("stockfish_eval", 0.0)
 
-        # output
         if self.save_pgns or self.show_moves:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
             filename = self.pgn_dir / f"sf_game_iter{self.iteration}_{timestamp}.pgn"
             if self.save_pgns:
                 try:
                     self._save_pgn_from_board(board, result, filename)
-                    print(f"💾 Saved PGN: {filename}")
+                    if not self.fast_eval:
+                        print(f"💾 Saved PGN: {filename}")
                 except Exception as e:
                     print(f"⚠ Failed to save PGN: {e}")
-            if self.show_moves:
+            if self.show_moves and not self.fast_eval:
                 print(f"Game result: {result} — moves:")
                 self._print_moves_from_board(board)
 
         moves_summary = self.moves_one_line(board)
         return game_positions, result, move_count, moves_summary
 
-
     # -------------------------
-    # Self-play
+    # Self-play (keeps behavior but with no_grad)
     # -------------------------
     def play_self_games(self, num_games=4, simulations_each=None, save_pgns=False, show_moves=False, show_debug=False):
         sim = simulations_each or self.num_simulations
         results = []
-        summaries = []   # <-- NEW
+        summaries = []
         for gi in range(num_games):
             board = chess.Board()
-            mcts_a = MCTS(self.network, num_simulations=sim, device=self.device, eval_batch_size=self.mcts_eval_batch, debug=self.mcts_debug)
-            mcts_b = MCTS(self.network, num_simulations=sim, device=self.device, eval_batch_size=self.mcts_eval_batch, debug=self.mcts_debug)
+            mcts_a = MCTS(self.network, num_simulations=sim, device=self.device, eval_batch_size=self.eval_batch_size, debug=self.mcts_debug)
+            mcts_b = MCTS(self.network, num_simulations=sim, device=self.device, eval_batch_size=self.eval_batch_size, debug=self.mcts_debug)
             move_count = 0
-            while not board.is_game_over() and move_count < 400:
-                if board.turn == chess.WHITE:
-                    res = mcts_a.search(board)
-                else:
-                    res = mcts_b.search(board)
-                move = res[1] if isinstance(res, tuple) else res
-                board.push(move)
-                move_count += 1
+            with torch.no_grad():
+                while not board.is_game_over() and move_count < 200:
+                    if board.turn == chess.WHITE:
+                        res = mcts_a.search(board)
+                    else:
+                        res = mcts_b.search(board)
+                    move = res[1] if isinstance(res, tuple) else res
+                    board.push(move)
+                    move_count += 1
 
             result = board.result()
             results.append(result)
-            moves_summary = self.moves_one_line(board)   # <-- already defined
+            moves_summary = self.moves_one_line(board)
             summaries.append((moves_summary, result))
-            # print in one line
-            print(f"Self-play game {gi+1}: Result {result}\n{moves_summary}\n")
+            if not self.fast_eval:
+                print(f"Self-play game {gi+1}: Result {result}\n{moves_summary}\n")
 
             if save_pgns:
                 timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
@@ -472,41 +466,11 @@ class EnhancedStockfishTrainer:
                     self._save_pgn_from_board(board, result, filename)
                 except Exception as e:
                     print(f"⚠ Failed to save self-play PGN: {e}")
-
         return results, summaries
 
-
-
     # -------------------------
-    # Training
+    # Training on batch
     # -------------------------
-    def _save_model_snapshot(self, snapshot_name=None):
-        if snapshot_name is None:
-            snapshot_name = f"snapshot_iter_{self.iteration}.pth"
-        snapshot_path = self.checkpoint_dir / snapshot_name
-        torch.save(self.network.state_dict(), snapshot_path)
-        # also keep canonical MODEL_PATH for compatibility
-        try:
-            torch.save(self.network.state_dict(), MODEL_PATH)
-        except Exception:
-            pass
-        return snapshot_path
-
-    def _load_latest_model_if_exists(self):
-        main_path = Path(MODEL_PATH)
-        if main_path.exists():
-            try:
-                sd = torch.load(main_path, map_location=self.device)
-                self.network.load_state_dict(sd)
-                if hasattr(self.network, "enable_fast_inference"):
-                    try:
-                        self.network.enable_fast_inference()
-                    except Exception:
-                        pass
-                print(f"✓ Loaded main model from {main_path}")
-            except Exception as e:
-                print(f"⚠ Could not load model: {e}")
-
     def train_on_batch(self):
         if self.balance_phases:
             samples_per_phase = max(1, self.batch_size // 3)
@@ -526,7 +490,7 @@ class EnhancedStockfishTrainer:
         boards = torch.from_numpy(np.array([d['board'] for d in batch], dtype=np.float32)).to(self.device)
         target_probs = torch.from_numpy(np.array([d['move_probs'] for d in batch], dtype=np.float32)).to(self.device)
 
-        # --- combine value targets ---
+        # combined value target
         target_values_np = []
         for d in batch:
             td = d.get("td_target", 0.0)
@@ -534,7 +498,6 @@ class EnhancedStockfishTrainer:
             final = d.get("final_outcome", 0.0)
             combined = 0.5 * td + 0.25 * sf + 0.25 * final
             target_values_np.append([combined])
-
         target_values = torch.from_numpy(np.array(target_values_np, dtype=np.float32)).to(self.device)
 
         self.network.train()
@@ -553,114 +516,181 @@ class EnhancedStockfishTrainer:
         return {'total_loss': total_loss.item(), 'policy_loss': policy_loss.item(), 'value_loss': value_loss.item()}
 
     # -------------------------
-    # Evaluate vs a snapshot (used to fight first-version)
+    # Evaluate vs a snapshot (fast, cached, no_grad)
     # -------------------------
-    def evaluate_vs_snapshot(self, snapshot_path, num_games=10, simulations_current=None, simulations_snapshot=None,
+    def evaluate_vs_snapshot(self, snapshot_path=None, num_games=10, simulations_current=None, simulations_snapshot=None,
                              save_pgns=False, show_moves=False, show_debug=False):
-        snapshot_path = Path(snapshot_path)
-        if not snapshot_path.exists():
-            print(f"⚠ Snapshot {snapshot_path} not found; skipping evaluation")
-            return None
-
-        snapshot_net = ChessNetwork().to(self.device)
-        snapshot_net.load_state_dict(torch.load(snapshot_path, map_location=self.device))
-        if hasattr(snapshot_net, "enable_fast_inference"):
-            try:
-                snapshot_net.enable_fast_inference()
-            except Exception:
-                pass
-        snapshot_net.eval()
+        # resolve snapshot net (prefer cached)
+        if self.initial_snapshot_net is not None:
+            snapshot_net = self.initial_snapshot_net
+        else:
+            if not snapshot_path:
+                print("⚠ No snapshot provided and no cached snapshot available")
+                return None
+            snapshot_path = Path(snapshot_path)
+            if not snapshot_path.exists():
+                print(f"⚠ Snapshot {snapshot_path} not found; skipping evaluation")
+                return None
+            snapshot_net = ChessNetwork().to(self.device)
+            snapshot_net.load_state_dict(torch.load(snapshot_path, map_location=self.device))
+            snapshot_net.eval()
+            for p in snapshot_net.parameters():
+                p.requires_grad = False
 
         sim_curr = simulations_current or self.num_simulations
-        sim_prev = simulations_snapshot or max(10, int(self.num_simulations * 0.5))
+        sim_prev = simulations_snapshot or max(self.snapshot_min_sims, int(sim_curr * self.snapshot_sim_fraction))
 
-        print(f"  🎮 NEW model: {sim_curr} sims | OLD (snapshot) model: {sim_prev} sims")
+        # print summary (only brief)
+        print(f"  🎮 NEW model: {sim_curr} sims | OLD (snapshot) model: {sim_prev} sims | games: {num_games}")
 
-        wins = 0.0
-        draws = 0
-        losses = 0.0
+        wins = draws = losses = 0.0
         moves_list = []
 
-        for i in range(num_games):
-            board = chess.Board()
-            move_count = 0
-            max_moves = 400
+        # ensure nets in eval and no grad
+        self.network.eval()
+        snapshot_net.eval()
+        for p in snapshot_net.parameters(): p.requires_grad = False
 
-            mcts_curr = MCTS(self.network, num_simulations=sim_curr, device=self.device, eval_batch_size=self.mcts_eval_batch, debug=self.mcts_debug)
-            mcts_prev = MCTS(snapshot_net, num_simulations=sim_prev, device=self.device, eval_batch_size=self.mcts_eval_batch, debug=self.mcts_debug)
-
-            curr_is_white = (i % 2 == 0)
-
-            while not board.is_game_over() and move_count < max_moves:
-                if (board.turn == chess.WHITE) == curr_is_white:
-                    res = mcts_curr.search(board)
-                    move = res[1] if isinstance(res, tuple) else res
-                    side = 'NEW'
+        # single-threaded default; optional parallelization (use with caution on GPU)
+        if self.parallel_eval_workers > 0 and self.is_cpu:
+            # Parallel evaluation strategy (CPU-only recommended)
+            results = self._parallel_evaluate_games(snapshot_net, num_games, sim_curr, sim_prev, save_pgns, show_moves, show_debug)
+            for res, move_count in results:
+                moves_list.append(move_count)
+                if res == "1-0":
+                    wins += 1
+                elif res == "0-1":
+                    losses += 1
                 else:
-                    res = mcts_prev.search(board)
-                    move = res[1] if isinstance(res, tuple) else res
-                    side = 'OLD'
+                    draws += 1
+        else:
+            # sequential evaluation
+            for i in range(num_games):
+                board = chess.Board()
+                move_count = 0
+                max_moves = 400
 
-                if show_debug or show_moves:
+                mcts_curr = MCTS(self.network, num_simulations=sim_curr, device=self.device, eval_batch_size=self.eval_batch_size, debug=self.mcts_debug)
+                mcts_prev = MCTS(snapshot_net, num_simulations=sim_prev, device=self.device, eval_batch_size=self.eval_batch_size, debug=self.mcts_debug)
+
+                curr_is_white = (i % 2 == 0)
+
+                # disable autograd during the whole game to avoid overhead
+                with torch.no_grad():
+                    while not board.is_game_over() and move_count < max_moves:
+                        if (board.turn == chess.WHITE) == curr_is_white:
+                            res = mcts_curr.search(board)
+                            move = res[1] if isinstance(res, tuple) else res
+                        else:
+                            res = mcts_prev.search(board)
+                            move = res[1] if isinstance(res, tuple) else res
+                        board.push(move)
+                        move_count += 1
+
+                res = board.result()
+                moves_list.append(move_count)
+
+                if save_pgns and not self.fast_eval:
                     try:
-                        print(f"{side} plays: {board.san(move)}")
-                    except Exception:
-                        print(f"{side} plays (uci): {move}")
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                        filename = self.pgn_dir / f"eval_iter{self.iteration}_game{i+1}_{timestamp}.pgn"
+                        self._save_pgn_from_board(board, res, filename)
+                    except Exception as e:
+                        print(f"⚠ Failed to save eval PGN: {e}")
 
-                board.push(move)
-                move_count += 1
+                if not self.fast_eval:
+                    print(f"Eval game {i+1}: {res} in {move_count} moves")
+                    if show_moves:
+                        self._print_moves_from_board(board)
 
-            res = board.result()
-            moves_list.append(move_count)
-
-            if save_pgns:
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-                filename = self.pgn_dir / f"eval_iter{self.iteration}_game{i+1}_{timestamp}.pgn"
-                try:
-                    self._save_pgn_from_board(board, res, filename)
-                    print(f"💾 Saved eval PGN: {filename}")
-                except Exception as e:
-                    print(f"⚠ Failed to save eval PGN: {e}")
-
-            if res == "1-0":
-                wins += 1 if curr_is_white else 0
-                losses += 0 if curr_is_white else 1
-            elif res == "0-1":
-                losses += 1 if curr_is_white else 0
-                wins += 0 if curr_is_white else 1
-            else:
-                draws += 1
-
-            if show_moves:
-                print(f"Eval game {i+1} result: {res}")
-                self._print_moves_from_board(board)
+                if res == "1-0":
+                    # if curr_is_white is True -> new model as white
+                    wins += 1 if curr_is_white else 0
+                    losses += 0 if curr_is_white else 1
+                elif res == "0-1":
+                    losses += 1 if curr_is_white else 0
+                    wins += 0 if curr_is_white else 1
+                else:
+                    draws += 1
 
         total = num_games
-        winrate = (wins + 0.5 * draws) / total
+        winrate = (wins + 0.5 * draws) / total if total > 0 else 0.0
         stats = {
             "games": total,
             "wins": wins,
             "draws": draws,
             "losses": losses,
             "winrate": winrate,
-            "avg_moves": float(np.mean(moves_list))
+            "avg_moves": float(np.mean(moves_list)) if moves_list else 0.0
         }
         return stats
 
+    def _parallel_evaluate_games(self, snapshot_net, num_games, sim_curr, sim_prev, save_pgns, show_moves, show_debug):
+        """
+        Helper to evaluate games in parallel using multiprocessing Pool.
+        NOTE: For GPU use, avoid parallel GPU workers unless you know how to manage device contexts.
+        This routine is only recommended on CPU or when you have per-process GPU assignment.
+        """
+        # Worker needs a picklable callable; pass minimal information like model paths, not model objects
+        # For simplicity, this implementation is CPU-only: we re-load snapshot and current network state_dict
+        curr_state = self.network.state_dict()
+        tmp_snapshot_path = None
+        results = []
+
+        def worker(args):
+            idx, curr_sd, snapshot_sd, device_str, simc, simp = args
+            # lightweight worker that reconstructs nets (CPU) and runs a game
+            dev = torch.device(device_str)
+            curr_net = ChessNetwork().to(dev)
+            curr_net.load_state_dict(curr_sd)
+            curr_net.eval()
+            snap_net = ChessNetwork().to(dev)
+            snap_net.load_state_dict(snapshot_sd)
+            snap_net.eval()
+            for p in snap_net.parameters(): p.requires_grad = False
+
+            mcts_curr = MCTS(curr_net, num_simulations=simc, device=dev, eval_batch_size=self.eval_batch_size, debug=False)
+            mcts_prev = MCTS(snap_net, num_simulations=simp, device=dev, eval_batch_size=self.eval_batch_size, debug=False)
+
+            board = chess.Board()
+            move_count = 0
+            with torch.no_grad():
+                curr_is_white = (idx % 2 == 0)
+                while not board.is_game_over() and move_count < 400:
+                    if (board.turn == chess.WHITE) == curr_is_white:
+                        res = mcts_curr.search(board)
+                        mv = res[1] if isinstance(res, tuple) else res
+                    else:
+                        res = mcts_prev.search(board)
+                        mv = res[1] if isinstance(res, tuple) else res
+                    board.push(mv)
+                    move_count += 1
+            return board.result(), move_count
+
+        # prepare args
+        snap_sd = {k: v.cpu() for k, v in (self.initial_snapshot_net.state_dict().items() if self.initial_snapshot_net else torch.load(self.initial_snapshot_path, map_location='cpu').items())}
+        curr_sd = {k: v.cpu() for k, v in curr_state.items()}
+
+        args_list = []
+        for i in range(num_games):
+            args_list.append((i, curr_sd, snap_sd, 'cpu', sim_curr, sim_prev))
+
+        with mp.Pool(processes=min(self.parallel_eval_workers, mp.cpu_count())) as pool:
+            results = pool.map(worker, args_list)
+        return results
+
     # -------------------------
-    # Main loop: three phases per cycle
+    # Main loop: three phases per cycle (optimized)
     # -------------------------
     def run_for_minutes(self,
                         minutes_limit=30,
-                        sf_games=20,
+                        sf_games=100,
                         selfplay_games=10,
-                        first_vs_games=10,
+                        first_vs_games=4,
                         training_batches=40,
                         stockfish_skill=1,
-                        stockfish_time_limit=0.08,
+                        stockfish_time_limit=0.02,
                         save_every=1,
-                        skip_phase2=False,
-                        phase2_every=1,
                         varied_starts=True):
         end_time = time.time() + (minutes_limit * 60)
         cycle = 0
@@ -678,7 +708,7 @@ class EnhancedStockfishTrainer:
                 print(f"🔁 Cycle {cycle} (iteration {self.iteration})")
                 print("=" * 60)
 
-                # Save snapshot before cycle (but we DO NOT use it for first-version fights)
+                # Save pre-cycle snapshot
                 pre_snapshot = self._save_model_snapshot(snapshot_name=f"snapshot_pre_iter_{self.iteration}.pth")
 
                 # PHASE A: vs Stockfish
@@ -691,7 +721,8 @@ class EnhancedStockfishTrainer:
                     if varied_starts and g > 0:
                         target_phase = ["opening", "midgame", "endgame"][g % 3]
                         starting_board = generate_varied_starting_position(self.stockfish_engine, target_phase)
-                        print(f"  Game {g+1} starting from {target_phase} position")
+                        if not self.fast_eval:
+                            print(f"  Game {g+1} starting from {target_phase} position")
                     else:
                         starting_board = None
 
@@ -701,7 +732,8 @@ class EnhancedStockfishTrainer:
                         starting_board=starting_board,
                         show_debug=self.mcts_debug
                     )
-                    print(f"Game {g+1} Result: {result} - Moves: {moves}\n{moves_summary}\n")
+                    if not self.fast_eval:
+                        print(f"Game {g+1} Result: {result} - Moves: {moves}\n{moves_summary}\n")
 
                     # add to replay buffer
                     if self.balance_phases:
@@ -718,9 +750,10 @@ class EnhancedStockfishTrainer:
                     elif result == "1/2-1/2":
                         wins += 0.5
 
-                    print(f"  Result: {result} in {moves} moves - {len(positions)} positions")
+                    if not self.fast_eval:
+                        print(f"  Result: {result} in {moves} moves - {len(positions)} positions")
 
-                if self.balance_phases:
+                if self.balance_phases and not self.fast_eval:
                     print(f"\n  📊 Phase distribution after Stockfish phase:")
                     for phase in ["opening", "midgame", "endgame"]:
                         count = phase_counts[phase]
@@ -729,32 +762,39 @@ class EnhancedStockfishTrainer:
 
                 winrate_sf = wins / sf_games if sf_games > 0 else 0
                 self.stats['phase1_winrates'].append(winrate_sf)
-                print(f"\n  🎯 PhaseA winrate (bot vs SF): {winrate_sf*100:.1f}%")
+                if not self.fast_eval:
+                    print(f"\n  🎯 PhaseA winrate (bot vs SF): {winrate_sf*100:.1f}%")
 
                 # Train after Stockfish
-                print(f"\n📚 Training: {training_batches} batches (after Stockfish)")
+                if not self.fast_eval:
+                    print(f"\n📚 Training: {training_batches} batches (after Stockfish)")
                 losses = []
                 for b in range(training_batches):
                     loss = self.train_on_batch()
                     if loss:
                         losses.append(loss['total_loss'])
-                    print(f"    Batch {b+1}/{training_batches} - Total Loss: {loss['total_loss']:.4f} "f"(Policy: {loss['policy_loss']:.4f}, Value: {loss['value_loss']:.4f})")
-                
+                    if not self.fast_eval and loss:
+                        print(f"    Batch {b+1}/{training_batches} - Total Loss: {loss['total_loss']:.4f} "
+                              f"(Policy: {loss['policy_loss']:.4f}, Value: {loss['value_loss']:.4f})")
+
                 if losses:
                     avg_loss = float(np.mean(losses))
                     self.stats['recent_losses'].append(avg_loss)
                     if len(self.stats['recent_losses']) > 10:
                         self.stats['recent_losses'].pop(0)
                     self.scheduler.step(avg_loss)
-                    print(f"  📈 Avg training loss (after SF): {avg_loss:.4f}")
+                    if not self.fast_eval:
+                        print(f"  📈 Avg training loss (after SF): {avg_loss:.4f}")
 
                 # PHASE B: Self-play
-                print(f"\n🤝 Phase B: Self-play {selfplay_games} games")
+                if not self.fast_eval:
+                    print(f"\n🤝 Phase B: Self-play {selfplay_games} games")
                 self.play_self_games(num_games=selfplay_games, simulations_each=2 if self.is_cpu else None,
                                      save_pgns=self.save_pgns, show_moves=self.show_moves)
 
                 # Train after self-play
-                print(f"\n📚 Training: {training_batches} batches (after self-play)")
+                if not self.fast_eval:
+                    print(f"\n📚 Training: {training_batches} batches (after self-play)")
                 losses = []
                 for b in range(training_batches):
                     loss = self.train_on_batch()
@@ -766,7 +806,8 @@ class EnhancedStockfishTrainer:
                     if len(self.stats['recent_losses']) > 10:
                         self.stats['recent_losses'].pop(0)
                     self.scheduler.step(avg_loss)
-                    print(f"  📈 Avg training loss (after self-play): {avg_loss:.4f}")
+                    if not self.fast_eval:
+                        print(f"  📈 Avg training loss (after self-play): {avg_loss:.4f}")
 
                 # PHASE C: vs initial (first-version)
                 print(f"\n🥊 Phase C: Evaluation vs FIRST version ({self.initial_snapshot_path.name}) - {first_vs_games} games")
@@ -774,13 +815,13 @@ class EnhancedStockfishTrainer:
                     str(self.initial_snapshot_path),
                     num_games=first_vs_games,
                     simulations_current=2 if self.is_cpu else self.num_simulations,
-                    simulations_snapshot=2 if self.is_cpu else self.num_simulations,
-                    save_pgns=self.save_pgns,
-                    show_moves=self.show_moves,
-                    show_debug=self.mcts_debug 
+                    simulations_snapshot=2 if self.is_cpu else max(self.snapshot_min_sims, int(self.num_simulations * self.snapshot_sim_fraction)),
+                    save_pgns=self.save_pgns and (not self.fast_eval),
+                    show_moves=self.show_moves and (not self.fast_eval),
+                    show_debug=self.mcts_debug
                 )
 
-                if eval_stats:
+                if eval_stats and not self.fast_eval:
                     print(f"\n  🏆 Winrate vs first-version: {eval_stats['winrate']*100:.1f}%")
 
                 # periodic checkpoint
@@ -807,35 +848,65 @@ class EnhancedStockfishTrainer:
             except Exception:
                 print("⚠ Could not save final model to MODEL_PATH")
 
+    # -------------------------
+    # IO: save canonical snapshot
+    # -------------------------
+    def _save_model_snapshot(self, snapshot_name=None):
+        if snapshot_name is None:
+            snapshot_name = f"snapshot_iter_{self.iteration}.pth"
+        snapshot_path = self.checkpoint_dir / snapshot_name
+        torch.save(self.network.state_dict(), snapshot_path)
+        try:
+            torch.save(self.network.state_dict(), MODEL_PATH)
+        except Exception:
+            pass
+        return snapshot_path
+
+    def _load_latest_model_if_exists(self):
+        main_path = Path(MODEL_PATH)
+        if main_path.exists():
+            try:
+                sd = torch.load(main_path, map_location=self.device)
+                self.network.load_state_dict(sd)
+                if hasattr(self.network, "enable_fast_inference"):
+                    try:
+                        self.network.enable_fast_inference()
+                    except Exception:
+                        pass
+                print(f"✓ Loaded main model from {main_path}")
+            except Exception as e:
+                print(f"⚠ Could not load model: {e}")
 
 # -------------------------
 # CLI
 # -------------------------
-
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--minutes", type=float, default=30)
-    parser.add_argument("--sf-games", type=int, default=20, help="Games vs Stockfish per cycle")
-    parser.add_argument("--selfplay-games", type=int, default=10, help="Self-play games per cycle")
-    parser.add_argument("--first-vs-games", type=int, default=10, help="Games vs initial first-version per cycle")
-    parser.add_argument("--training-batches", type=int, default=40)
-    parser.add_argument("--stockfish-path", type=str, default="dist/stockfish.exe")
+    parser.add_argument("--sf-games", type=int, default=100, help="Games vs Stockfish per cycle (reduced default)")
+    parser.add_argument("--selfplay-games", type=int, default=6, help="Self-play games per cycle")
+    parser.add_argument("--first-vs-games", type=int, default=4, help="Games vs initial first-version per cycle")
+    parser.add_argument("--training-batches", type=int, default=128)
+    parser.add_argument("--stockfish-path", type=str, default="dist/stockfish-ubuntu-x86-64-avx2")
     parser.add_argument("--stockfish-skill", type=int, default=1)
-    parser.add_argument("--stockfish-time", type=float, default=0.08)
-    parser.add_argument("--simulations", type=int, default=100)
+    parser.add_argument("--stockfish-time", type=float, default=0.02)
+    parser.add_argument("--simulations", type=int, default=128)
+    parser.add_argument("--snapshot-sim-fraction", type=float, default=0.25, help="Fraction of simulations for snapshot side")
+    parser.add_argument("--snapshot-min-sims", type=int, default=8, help="Min sims for snapshot side")
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--buffer-size", type=int, default=50000)
     parser.add_argument("--torch-threads", type=int, default=None)
     parser.add_argument("--no-balance", action="store_true", help="Disable phase balancing")
     parser.add_argument("--no-varied-starts", action="store_true", help="Always start from initial position")
-
     parser.add_argument("--show-moves", action="store_true", help="Print moves as games are played")
     parser.add_argument("--save-pgns", action="store_true", help="Save PGNs for games (phase1/self/eval)")
     parser.add_argument("--pgn-dir", type=str, default="games")
     parser.add_argument("--self-games", type=int, default=0, help="Number of self-play games to run/print each cycle")
     parser.add_argument("--mcts-debug", action="store_true", help="Enable MCTS debug prints")
     parser.add_argument("--stockfish-threads", type=int, default=None, help="Threads to give Stockfish")
-
+    parser.add_argument("--eval-batch-size", type=int, default=None, help="MCTS eval batch size (bigger batches -> faster GPU)")
+    parser.add_argument("--fast-eval", action="store_true", help="Silence heavy IO during Phase C for speed")
+    parser.add_argument("--parallel-eval-workers", type=int, default=0, help="Parallel evaluation workers (CPU-only recommended)")
     args = parser.parse_args()
 
     trainer = EnhancedStockfishTrainer(
@@ -843,6 +914,8 @@ def main():
         buffer_size=args.buffer_size,
         batch_size=args.batch_size,
         num_simulations=args.simulations,
+        snapshot_sim_fraction=args.snapshot_sim_fraction,
+        snapshot_min_sims=args.snapshot_min_sims,
         device=None,
         checkpoint_dir="checkpoints",
         torch_threads=args.torch_threads,
@@ -852,7 +925,10 @@ def main():
         pgn_dir=args.pgn_dir,
         self_games_per_cycle=args.self_games,
         mcts_debug=args.mcts_debug,
-        stockfish_threads=args.stockfish_threads
+        stockfish_threads=args.stockfish_threads,
+        eval_batch_size=args.eval_batch_size,
+        fast_eval=args.fast_eval,
+        parallel_eval_workers=args.parallel_eval_workers
     )
 
     trainer.run_for_minutes(
@@ -865,7 +941,6 @@ def main():
         stockfish_time_limit=args.stockfish_time,
         varied_starts=not args.no_varied_starts
     )
-
 
 if __name__ == "__main__":
     main()
