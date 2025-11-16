@@ -1,344 +1,332 @@
+#!/usr/bin/env python3
 import os
-import random
+import chess
 import chess.pgn
 import numpy as np
 import torch
 from torch import nn, optim
-from collections import defaultdict
+from torch.cuda.amp import autocast, GradScaler
+from collections import defaultdict, OrderedDict
+from tqdm import tqdm
+from chess.engine import SimpleEngine, Limit
+import argparse
+
 from board_state import board_to_tensor
 from network_architecture import ChessNetwork
 
-# -------------------------------
-# Game Phase Classification
-# -------------------------------
-def classify_game_phase(board):
-    move_count = board.fullmove_number
+
+###########################################
+# CONFIG
+###########################################
+STOCKFISH_PATH = "dist/stockfish.exe"
+BASE_DEPTH = 6          # adaptive depth (will increase for endgames)
+CP_SCALE = 300
+USE_MIXED_PRECISION = True
+CACHE_SIZE = 50000      # Stockfish eval cache size (LRU)
+
+
+###########################################
+# LRU cache for Stockfish evaluations
+###########################################
+_eval_cache = OrderedDict()
+
+
+def _cache_get(fen):
+    return _eval_cache.get(fen, None)
+
+
+def _cache_set(fen, val):
+    _eval_cache[fen] = val
+    # evict oldest
+    if len(_eval_cache) > CACHE_SIZE:
+        _eval_cache.popitem(last=False)
+
+
+###########################################
+# STOCKFISH EVALUATION (with cache)
+###########################################
+def evaluate_with_stockfish(engine, board):
+    """Return normalized value from -1 to 1 using Stockfish evaluation with LRU caching."""
+    fen = board.fen()
+    cached = _cache_get(fen)
+    if cached is not None:
+        return cached
+
+    # Adaptive depth: deeper when fewer pieces remain
     piece_count = len(board.piece_map())
-    queens = len(board.pieces(chess.QUEEN, chess.WHITE)) + len(board.pieces(chess.QUEEN, chess.BLACK))
-    rooks = len(board.pieces(chess.ROOK, chess.WHITE)) + len(board.pieces(chess.ROOK, chess.BLACK))
+    depth = BASE_DEPTH if piece_count >= 20 else BASE_DEPTH + 3
 
-    if piece_count <= 10 or (queens == 0 and rooks <= 2):
+    val = 0.0
+    try:
+        info = engine.analyse(board, Limit(depth=depth))
+        score = info.get("score")
+        if score is None:
+            val = 0.0
+        else:
+            score = score.white()
+            if score.is_mate():
+                mate = score.mate()
+                if mate is None:
+                    val = 0.0
+                else:
+                    val = 1.0 if mate > 0 else -1.0
+            else:
+                cp = score.score()
+                if cp is None:
+                    val = 0.0
+                else:
+                    val = float(np.tanh(cp / CP_SCALE))
+    except Exception:
+        val = 0.0
+
+    _cache_set(fen, val)
+    return val
+
+
+###########################################
+# GAME PHASE LOGIC
+###########################################
+def classify_game_phase(board):
+    piece_count = len(board.piece_map())
+    if piece_count <= 14:
         return "endgame"
-    elif move_count <= 12 and piece_count >= 28:
+    elif piece_count >= 26:
         return "opening"
-    else:
-        return "midgame"
+    return "midgame"
 
 
-def is_position_worth_learning(board, move_number):
-    if move_number < 5:
-        return False
-    if len(list(board.legal_moves)) < 3:
-        return False
-    if board.is_checkmate() or board.is_stalemate():
-        return False
-    return True
-
-
-# -------------------------------
-# Load PGN games with filtering
-# -------------------------------
-def load_pgn_games(pgn_folder, min_elo=1800, max_games_per_file=1000):
+###########################################
+# PGN LOADER (fast)
+###########################################
+def load_pgn_games(pgn_folder, max_games_per_file=500):
     games = []
-    for filename in os.listdir(pgn_folder):
+    if not os.path.isdir(pgn_folder):
+        print(f"❌ PGN folder not found: {pgn_folder}")
+        return games
+
+    for filename in sorted(os.listdir(pgn_folder)):
         if not filename.endswith(".pgn"):
             continue
         path = os.path.join(pgn_folder, filename)
         loaded = 0
-        with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+        with open(path, encoding="utf-8", errors="ignore") as f:
             while True:
-                game = chess.pgn.read_game(f)
-                if game is None:
+                g = chess.pgn.read_game(f)
+                if g is None:
                     break
-                try:
-                    white_elo = int(game.headers.get("WhiteElo", 0))
-                    black_elo = int(game.headers.get("BlackElo", 0))
-                    avg_elo = (white_elo + black_elo) / 2
-                    if avg_elo >= min_elo:
-                        games.append(game)
-                        loaded += 1
-                except Exception:
-                    # skip games missing ELO header or malformed
-                    pass
+                games.append(g)
+                loaded += 1
                 if loaded >= max_games_per_file:
                     break
-        print(f"✓ Finished {filename}: loaded {loaded} games (avg ELO >= {min_elo})")
+        print(f"   ✓ Loaded {loaded} games from {filename}")
     return games
 
 
-# -------------------------------
-# Prepare training data
-# -------------------------------
-def prepare_training_data(games,
-                          focus_phase="all",
-                          opening_weight=0.3,
-                          midgame_weight=0.4,
-                          endgame_weight=0.3,
-                          skip_early_moves=5):
-    training_data = {"opening": [], "midgame": [], "endgame": []}
+###########################################
+# DATASET BUILDER
+###########################################
+def prepare_data(games, engine, debug=False):
+    phases = defaultdict(list)
 
-    for j, game in enumerate(games, 1):
+    for game in tqdm(games, desc="Extracting"):
         board = chess.Board()
-        outcome = game.headers.get("Result", "*")
-        if outcome not in ["1-0", "0-1", "1/2-1/2"]:
-            continue
-
-        moves_list = list(game.mainline_moves())
-        total_moves = len(moves_list)
-        if total_moves < 15:
-            continue
-
-        for move_number, move in enumerate(moves_list, start=1):
-            if move_number <= skip_early_moves:
+        moves = list(game.mainline_moves())
+        for move in moves:
+            # safety: if no legal moves for some reason, skip
+            legal = list(board.legal_moves)
+            if len(legal) == 0:
                 board.push(move)
                 continue
 
-            if not is_position_worth_learning(board, move_number):
-                board.push(move)
-                continue
-
+            pos = board_to_tensor(board)
             phase = classify_game_phase(board)
 
-            # discounted value target
-            moves_to_end = total_moves - move_number
-            discount_factor = np.exp(-moves_to_end / 20.0)
-            if outcome == "1-0":
-                base_value = 1.0 if board.turn == chess.WHITE else -1.0
-            elif outcome == "0-1":
-                base_value = -1.0 if board.turn == chess.WHITE else 1.0
-            else:
-                base_value = 0.0
-            value_target = base_value * discount_factor
+            # policy vector (vectorized-ish)
+            policy = np.zeros(4096, dtype=np.float32)
+            inv = 1.0 / len(legal)
+            for m in legal:
+                idx = m.from_square * 64 + m.to_square
+                policy[idx] = inv
 
-            # position tensor (ensure numpy float32)
-            position_array = np.array(board_to_tensor(board), dtype=np.float32)
+            teacher_idx = move.from_square * 64 + move.to_square
+            policy[teacher_idx] += 0.25
+            # re-normalize
+            s = policy.sum()
+            if s > 0:
+                policy /= s
 
-            # policy target: uniform over legal moves, slight boost for played move
-            policy_target = np.zeros(64 * 64, dtype=np.float32)
-            legal_moves = list(board.legal_moves)
-            if len(legal_moves) == 0:
-                board.push(move)
-                continue
+            value = evaluate_with_stockfish(engine, board)
 
-            for legal_move in legal_moves:
-                idx = legal_move.from_square * 64 + legal_move.to_square
-                policy_target[idx] = 1.0 / len(legal_moves)
-
-            # boost actual move slightly
-            actual_idx = move.from_square * 64 + move.to_square
-            policy_target[actual_idx] += 0.3
-            # normalize
-            policy_target = policy_target / policy_target.sum()
-
-            training_data[phase].append({
-                "position": position_array,
-                "policy_target": policy_target,
-                "value_target": float(value_target),
-                "move_number": move_number,
-                "phase": phase
-            })
-
+            phases[phase].append((pos, policy, value))
             board.push(move)
 
-        if j % 50 == 0:
-            print(f"Processed {j} games (collected so far: "
-                  f"open={len(training_data['opening'])}, "
-                  f"mid={len(training_data['midgame'])}, "
-                  f"end={len(training_data['endgame'])})")
+    print("Phase counts:", {k: len(v) for k, v in phases.items()})
 
-    # print stats
-    print("\n" + "="*60)
-    print("📊 Training Data Statistics:")
-    for phase in ["opening", "midgame", "endgame"]:
-        print(f"{phase.capitalize()}: {len(training_data[phase]):,} positions")
-    print("="*60 + "\n")
+    # If any phase has zero samples, avoid sampling error
+    for p in ("opening", "midgame", "endgame"):
+        if p not in phases or len(phases[p]) == 0:
+            phases[p] = []
 
-    # combine based on weights if focus == all
-    if focus_phase == "all":
-        combined = []
-        total_positions = sum(len(training_data[p]) for p in training_data)
-        weights = {"opening": opening_weight, "midgame": midgame_weight, "endgame": endgame_weight}
-        for phase, weight in weights.items():
-            phase_data = training_data[phase]
-            if len(phase_data) == 0:
-                continue
-            target_samples = int(total_positions * weight)
-            if target_samples <= 0:
-                continue
-            if len(phase_data) < target_samples:
-                idxs = np.random.choice(len(phase_data), target_samples, replace=True)
-            else:
-                idxs = np.random.choice(len(phase_data), target_samples, replace=False)
-            combined.extend([phase_data[i] for i in idxs])
-        random.shuffle(combined)
-        return combined
+    # Select counts per phase (you can tune these)
+    target_open = 20000
+    target_mid = 40000
+    target_end = 60000
 
-    elif focus_phase in training_data:
-        return training_data[focus_phase]
+    # If debug: we only want a tiny dataset for quick checks
+    if debug:
+        # just pick up to 100 combined samples (prefer endgame)
+        selected = []
+        # try to pull from endgame first
+        for src in ("endgame", "midgame", "opening"):
+            take = min(100 - len(selected), len(phases[src]))
+            if take > 0:
+                idxs = np.random.choice(len(phases[src]), take, replace=False)
+                selected.extend([phases[src][i] for i in idxs])
+            if len(selected) >= 100:
+                break
+        print(f"DEBUG mode: prepared {len(selected)} samples (should be 100 or fewer)")
+        return selected
 
-    else:
-        # fallback to all combined
-        combined = training_data["opening"] + training_data["midgame"] + training_data["endgame"]
-        random.shuffle(combined)
-        return combined
+    # Normal (non-debug) flow: sample indices (with replacement if needed)
+    final = []
+
+    def sample_from_phase(phase_list, count):
+        if len(phase_list) == 0:
+            return []
+        if len(phase_list) >= count:
+            idxs = np.random.choice(len(phase_list), count, replace=False)
+        else:
+            idxs = np.random.choice(len(phase_list), count, replace=True)
+        return [phase_list[i] for i in idxs]
+
+    final.extend(sample_from_phase(phases["opening"], target_open))
+    final.extend(sample_from_phase(phases["midgame"], target_mid))
+    final.extend(sample_from_phase(phases["endgame"], target_end))
+
+    np.random.shuffle(final)
+    print("Prepared final dataset size:", len(final))
+    return final
 
 
-# -------------------------------
-# Main training
-# -------------------------------
-def train(pgn_folder="./pgn_folder",
-          focus_phase="all",
-          opening_weight=0.2,
-          midgame_weight=0.4,
-          endgame_weight=0.4,
-          epochs=5,
-          batch_size=64,
-          learning_rate=1e-4,
-          model_path="models/trained_model.pth",
-          entropy_coef=0.0,
-          device_override=None):
-    device = torch.device(device_override if device_override else ("cuda" if torch.cuda.is_available() else "cpu"))
-    print("🔧 Using device:", device)
-    if device.type == "cuda":
-        print("   GPU:", torch.cuda.get_device_name(0))
+###########################################
+# TRAINING LOOP (with debug flag)
+###########################################
+def train(model_path="models/fast_model.pth", pgn_folder="pgn_folder", debug=False):
+    # start engine
+    engine = SimpleEngine.popen_uci(STOCKFISH_PATH)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"🧠 Device: {device}")
 
-    print("\n📖 Loading PGN games...")
-    games = load_pgn_games(pgn_folder, min_elo=1800, max_games_per_file=1000)
-    print(f"✓ Total quality games loaded: {len(games)}\n")
-
-    if len(games) == 0:
-        print("❌ No games loaded! Check your PGN folder.")
-        return
-
-    print(f"⚙️  Preparing training data (focus: {focus_phase})...")
-    training_data = prepare_training_data(games,
-                                          focus_phase=focus_phase,
-                                          opening_weight=opening_weight,
-                                          midgame_weight=midgame_weight,
-                                          endgame_weight=endgame_weight)
-    print(f"✓ Total training positions: {len(training_data):,}\n")
-
-    if len(training_data) == 0:
-        print("❌ No training data prepared!")
-        return
-
-    # model and optimizer
-    network = ChessNetwork().to(device)
+    # model init / load
+    model = ChessNetwork().to(device)
     if os.path.exists(model_path):
         try:
-            network.load_state_dict(torch.load(model_path, map_location=device))
-            print(f"✓ Loaded existing model from {model_path}")
+            model.load_state_dict(torch.load(model_path, map_location=device))
+            print("🔁 Loaded existing model weights.")
         except Exception as e:
-            print(f"⚠️ Could not load model: {e}\n   Starting with fresh weights")
+            print("⚠ Could not load model weights:", e)
 
-    network.train()
-    optimizer = optim.AdamW(network.parameters(), lr=learning_rate, weight_decay=1e-4)
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=2)
+    # optional: compile with TorchScript (keeps interface same)
+    try:
+        scripted = torch.jit.script(model)
+        model = scripted
+        print("⚡ Model compiled with TorchScript.")
+    except Exception as e:
+        print("⚠ TorchScript compilation failed, continuing with the Python model:", e)
 
-    # losses
-    policy_loss_fn = nn.KLDivLoss(reduction='batchmean')  # expects log-probs vs probs
-    value_loss_fn = nn.SmoothL1Loss()  # Huber-style stable regression loss
+    # optimizer & scaler
+    optimizer = optim.AdamW(model.parameters(), lr=1e-4)
+    scaler = GradScaler(enabled=(USE_MIXED_PRECISION and torch.cuda.is_available()))
 
-    print("=" * 60)
-    print("🚀 Starting Training")
-    print("=" * 60)
+    # load games
+    games = load_pgn_games(pgn_folder)
 
-    for epoch in range(1, epochs + 1):
-        random.shuffle(training_data)
+    # ---------------------------
+    # DEBUG GAME LIMIT: if debug, KEEP ONLY THE FIRST 50 GAMES
+    # ---------------------------
+    if debug:
+        original_count = len(games)
+        games = games[:50]
+        print(f"🔧 DEBUG MODE → Limiting games to first {len(games)} of {original_count} total loaded.")
+    # ---------------------------
+
+    # prepare data from those games
+    data = prepare_data(games, engine, debug=debug)
+
+    # Debug: show a sample entry
+    if debug and len(data) > 0:
+        print("Sample entry (position shape, policy nonzero count, value):",
+              np.array(data[0][0]).shape,
+              int(np.count_nonzero(data[0][1])),
+              data[0][2])
+
+    # if debug reduce batch size and epochs for speed
+    epochs = 4 if debug else 4
+    batch_size = 8 if debug else 128
+
+    print(f"Starting training | epochs={epochs} batch_size={batch_size} samples={len(data)}")
+
+    for epoch in range(epochs):
         epoch_losses = []
-        policy_losses = []
-        value_losses = []
+        for i in tqdm(range(0, len(data), batch_size), desc=f"Epoch {epoch+1}"):
+            batch = data[i:i+batch_size]
+            if len(batch) == 0:
+                continue
 
-        for i in range(0, len(training_data), batch_size):
-            batch = training_data[i:i + batch_size]
+            positions = torch.tensor([b[0] for b in batch], dtype=torch.float32).to(device, non_blocking=True)
+            policy_targets = torch.tensor([b[1] for b in batch], dtype=torch.float32).to(device)
+            value_targets = torch.tensor([[b[2]] for b in batch], dtype=torch.float32).to(device)
 
-            # safety: ensure shapes are consistent
-            positions_np = np.stack([np.array(d["position"], dtype=np.float32) for d in batch])
-            policy_np = np.stack([np.array(d["policy_target"], dtype=np.float32) for d in batch])
-            value_np = np.array([[d["value_target"]] for d in batch], dtype=np.float32)
+            with autocast(enabled=(USE_MIXED_PRECISION and torch.cuda.is_available())):
+                policy_pred, value_pred = model(positions)
+                policy_loss = -torch.mean(torch.sum(policy_targets * torch.log_softmax(policy_pred, dim=1), dim=1))
+                value_loss = torch.nn.functional.mse_loss(value_pred, value_targets)
+                loss = policy_loss * 0.6 + value_loss * 0.4
+                if debug and (i // batch_size) % 50 == 0:
+                    # Show first entry of batch
+                    sf_score = value_targets[0].item()
+                    pred_value = value_pred[0].item()
 
-            positions = torch.from_numpy(positions_np).to(device)
-            policy_targets = torch.from_numpy(policy_np).to(device)
-            value_targets = torch.from_numpy(value_np).to(device)
+                    # Extract a top predicted move index
+                    best_move_idx = torch.argmax(policy_pred[0]).item()
+                    
+                    print("\n---------------- DEBUG SAMPLE ----------------")
+                    print(f"Batch step: {i // batch_size}")
+                    print(f"Predicted Value:     {pred_value:.4f}")
+                    print(f"Stockfish Target:    {sf_score:.4f}")
+                    print(f"Value Loss:          {value_loss.item():.4f}")
+                    print(f"Policy Loss:         {policy_loss.item():.4f}")
+                    print(f"Total Loss:          {loss.item():.4f}")
+                    print(f"Top Policy Move ID:  {best_move_idx}")
+                    print("------------------------------------------------")
+                
 
-            # forward
-            policy_pred_logits, value_pred = network(positions)  # expect (B, P) and (B, 1) shapes
-
-            # policy loss (KLDiv requires log-probs input)
-            log_probs = torch.log_softmax(policy_pred_logits, dim=1)
-            policy_loss = policy_loss_fn(log_probs, policy_targets)
-
-            # value loss
-            value_loss = value_loss_fn(value_pred, value_targets)
-
-            # optional entropy bonus to encourage exploration (usually small)
-            if entropy_coef and entropy_coef > 0.0:
-                probs = torch.softmax(policy_pred_logits, dim=1)
-                entropy = -torch.mean(torch.sum(probs * log_probs, dim=1))
-            else:
-                entropy = 0.0
-
-            # combined loss (weights can be tuned; 1.0/1.0 is standard for AlphaZero; we keep adjustable mix)
-            total_loss = 0.7 * policy_loss + 0.3 * value_loss - entropy_coef * (entropy if isinstance(entropy, torch.Tensor) else 0.0)
-
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(network.parameters(), max_norm=1.0)
-            optimizer.step()
 
-            epoch_losses.append(total_loss.item())
-            policy_losses.append(policy_loss.item())
-            value_losses.append(value_loss.item())
+            epoch_losses.append(loss.item())
 
-            # progress print every N batches
-            batch_num = i // batch_size + 1
-            if batch_num % 50 == 0 or (i + batch_size) >= len(training_data):
-                recent = np.mean(epoch_losses[-50:]) if len(epoch_losses) >= 1 else float('nan')
-                print(f"Epoch {epoch}/{epochs} | Batch {batch_num} / {int(np.ceil(len(training_data)/batch_size))} "
-                      f"| loss: {recent:.4f} (policy: {np.mean(policy_losses[-50:]):.4f}, value: {np.mean(value_losses[-50:]):.4f})")
-
-        avg_epoch_loss = float(np.mean(epoch_losses)) if len(epoch_losses) else 0.0
-        avg_policy = float(np.mean(policy_losses)) if len(policy_losses) else 0.0
-        avg_value = float(np.mean(value_losses)) if len(value_losses) else 0.0
-
-        print(f"\n✓ Epoch {epoch}/{epochs} completed — avg loss: {avg_epoch_loss:.4f} "
-              f"(policy: {avg_policy:.4f}, value: {avg_value:.4f})\n")
-
-        scheduler.step(avg_epoch_loss)
+        avg = float(np.mean(epoch_losses)) if epoch_losses else 0.0
+        print(f"📉 Epoch {epoch+1} loss: {avg:.4f}")
 
     # final save
     os.makedirs(os.path.dirname(model_path) or ".", exist_ok=True)
-    torch.save(network.state_dict(), model_path)
-    print("=" * 60)
-    print(f"✅ Model saved to {model_path}")
-    print("=" * 60)
+    torch.save(model.state_dict(), model_path)
+    print(f"\n✅ Model saved → {model_path}")
+
+    engine.quit()
 
 
-# -------------------------------
-# CLI entrypoint
-# -------------------------------
+###########################################
+# CLI
+###########################################
 if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser(description="Train chess network from PGN games")
-    parser.add_argument("--pgn-folder", type=str, default="./pgn_folder")
-    parser.add_argument("--focus", type=str, default="all", choices=["all", "opening", "midgame", "endgame"])
-    parser.add_argument("--opening-weight", type=float, default=0.2)
-    parser.add_argument("--midgame-weight", type=float, default=0.4)
-    parser.add_argument("--endgame-weight", type=float, default=0.4)
-    parser.add_argument("--epochs", type=int, default=5)
-    parser.add_argument("--batch-size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--model-path", type=str, default="models/midgame_model.pth")
-    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pgn-folder", type=str, default="pgn_folder")
+    parser.add_argument("--model-path", type=str, default="models/fast_model.pth")
+    parser.add_argument("--debug", action="store_true", help="Run small debug data pass (process only first 50 games)")
     args = parser.parse_args()
 
-    train(pgn_folder=args.pgn_folder,
-          focus_phase=args.focus,
-          opening_weight=args.opening_weight,
-          midgame_weight=args.midgame_weight,
-          endgame_weight=args.endgame_weight,
-          epochs=args.epochs,
-          batch_size=args.batch_size,
-          learning_rate=args.lr,
-          model_path=args.model_path,
-          entropy_coef=args.entropy_coef)
+    train(model_path=args.model_path, pgn_folder=args.pgn_folder, debug=args.debug)

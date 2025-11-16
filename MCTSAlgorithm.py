@@ -15,6 +15,7 @@ class MCTSNode:
         self.visit_count = 0
         self.total_value = 0.0
         self.prior_prob = prior_prob  # From policy network
+        self.repetition_count = 0
 
     def is_leaf(self):
         return len(self.children) == 0
@@ -28,13 +29,14 @@ class MCTSNode:
 
 class MCTS:
     def __init__(self, network, num_simulations=NUM_SIMULATIONS, c_puct=C_PUCT,
-                 device=None, eval_batch_size=16, use_autocast=True):
+                 device=None, eval_batch_size=16, use_autocast=True, debug=False):
         self.network = network
         self.num_simulations = int(num_simulations)
         self.c_puct = c_puct
         self.device = device if device else torch.device('cpu')
         self.eval_batch_size = int(eval_batch_size)
         self.use_autocast = use_autocast and (self.device.type == 'cuda')
+        self.debug = debug  # <-- store debug flag
         # Ensure network stays on device once
         try:
             self.network.to(self.device)
@@ -44,38 +46,58 @@ class MCTS:
     def search(self, board):
         root = MCTSNode(board)
 
+        '''if self.debug:
+            print(f"[DEBUG] Starting MCTS search for {self.num_simulations} simulations")'''
+
         # expand root once (so root has priors)
         if not root.board.is_game_over():
             self._expand_node_single(root)
+        self._add_exploration_noise(root)
 
-        # We'll accumulate leaf nodes and their search paths for batched eval
-        pending_leaves = []  # list of tuples (node, search_path)
+        pending_leaves = []
 
         for sim in range(self.num_simulations):
             node = root
             search_path = [node]
 
-            # SELECT down to a leaf or terminal
             while not node.is_leaf() and not node.board.is_game_over():
                 node = self._select_child(node)
                 search_path.append(node)
 
             if node.board.is_game_over():
-                # Terminal node value
                 val = self._result_to_value(node.board.result(), node.board.turn)
                 self._backpropagate(search_path, val)
+                '''if self.debug:
+                    print(f"[DEBUG] Terminal node reached: result={node.board.result()}, value={val}")'''
                 continue
 
-            # At this point node is a leaf and non-terminal -> schedule it for batch expansion
             pending_leaves.append((node, search_path))
 
-            # If batch full or last simulation, evaluate the batch
             if len(pending_leaves) >= self.eval_batch_size or sim == (self.num_simulations - 1):
                 self._evaluate_and_expand_batch(pending_leaves)
+                '''if self.debug:
+                    print(f"[DEBUG] Evaluated batch of {len(pending_leaves)} leaves at simulation {sim+1}")'''
                 pending_leaves = []
 
-        # 🔥 FIX: Return both root and best move for training data collection
+        if self.debug:
+            '''print(f"[DEBUG] MCTS search completed. Root children visits:")
+            for move, child in root.children.items():
+                print(f"  Move: {move}, visits: {child.visit_count}, value: {child.value():.3f}")'''
+
         return (root, self._best_move(root))
+    def _add_exploration_noise(self, node, alpha=0.3, frac=0.25):
+        """Add Dirichlet noise to root node priors (for exploration)."""
+        moves = list(node.children.keys())
+        if not moves:
+            return
+
+        noise = np.random.dirichlet([alpha] * len(moves))
+        for move, n in zip(moves, noise):
+            old_prior = node.children[move].prior_prob
+            node.children[move].prior_prob = (1 - frac) * old_prior + frac * n
+            '''if self.debug:
+                print(f"[DEBUG] Noise applied to move {move}: old={old_prior:.3f}, noise={n:.3f}, new={node.children[move].prior_prob:.3f}")'''
+
 
     def _evaluate_and_expand_batch(self, pending):
         """
@@ -148,19 +170,25 @@ class MCTS:
                 self._backpropagate(path, value)
 
     def _select_child(self, node):
-        if not node.children:  # If no children, stop selecting deeper
+        if not node.children:
             return node
 
         best_score = -float('inf')
         best_child = None
-
-        # Precompute sqrt(parent_visits) to reduce per-child cost
         sqrt_parent = np.sqrt(node.visit_count) if node.visit_count > 0 else 1.0
 
         for move, child in node.children.items():
             Q = child.value()
-            U = (self.c_puct * child.prior_prob * (sqrt_parent) / (1 + child.visit_count))
-            score = Q + U
+            U = (self.c_puct * child.prior_prob * sqrt_parent / (1 + child.visit_count))
+            repeat_penalty = 0
+            if child.board.is_repetition(1):
+                child.repetition_count += 1
+                repeat_penalty = 0.5 * child.repetition_count
+
+            score = Q + U - repeat_penalty
+
+            '''if self.debug:
+                print(f"[DEBUG] Move {move}: Q={Q:.3f}, U={U:.3f}, penalty={repeat_penalty}, score={score:.3f}")'''
 
             if score > best_score:
                 best_score = score
@@ -168,13 +196,15 @@ class MCTS:
 
         return best_child
 
+
+
     def _result_to_value(self, result, turn):
         if result == "1-0":
             return 1 if turn else -1
         elif result == "0-1":
             return -1 if turn else 1
         else:
-            return 0
+            return -0.3
 
     def _expand_node_single(self, node):
         """

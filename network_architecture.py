@@ -1,42 +1,56 @@
 import torch
 import torch.nn as nn
-from config import INPUT_CHANNELS, RESIDUAL_BLOCKS, HIDDEN_CHANNELS, POLICY_OUTPUT_SIZE
 import numpy as np
+from config import INPUT_CHANNELS, RESIDUAL_BLOCKS, HIDDEN_CHANNELS, POLICY_OUTPUT_SIZE
+
 
 class ChessNetwork(nn.Module):
     def __init__(self):
         super().__init__()
         
+        # --------------------------
         # Shared backbone
+        # --------------------------
         self.conv1 = nn.Conv2d(INPUT_CHANNELS, 64, kernel_size=3, padding=1)
         self.bn1 = nn.BatchNorm2d(64)
+
         self.conv2 = nn.Conv2d(64, HIDDEN_CHANNELS, kernel_size=3, padding=1)
         self.bn2 = nn.BatchNorm2d(HIDDEN_CHANNELS)
+
         self.conv3 = nn.Conv2d(HIDDEN_CHANNELS, HIDDEN_CHANNELS, kernel_size=3, padding=1)
         self.bn3 = nn.BatchNorm2d(HIDDEN_CHANNELS)
-        
+
+        # --------------------------
         # ResNet blocks
+        # --------------------------
         self.res_blocks = nn.ModuleList([
             ResidualBlock(HIDDEN_CHANNELS) for _ in range(RESIDUAL_BLOCKS)
         ])
-        
+
+        # --------------------------
         # Policy head
+        # --------------------------
         self.policy_conv = nn.Conv2d(HIDDEN_CHANNELS, 32, kernel_size=1)
         self.policy_bn = nn.BatchNorm2d(32)
         self.policy_fc = nn.Linear(32 * 8 * 8, POLICY_OUTPUT_SIZE)
 
-        
+        # --------------------------
         # Value head
+        # --------------------------
         self.value_conv = nn.Conv2d(HIDDEN_CHANNELS, 32, kernel_size=1)
         self.value_bn = nn.BatchNorm2d(32)
         self.value_fc1 = nn.Linear(32 * 8 * 8, 256)
-        self.value_fc2 = nn.Linear(256, 1)
         self.value_fc1_bn = nn.BatchNorm1d(256)
-        self.dropout = nn.Dropout(0.3)
+        self.value_fc2 = nn.Linear(256, 1)
 
-        
+        self.dropout = nn.Dropout(0.25)
+
+        # Runtime flag
+        self.optimized = False
+    
+
     def forward(self, x):
-        # Shared processing
+        # Shared trunk
         x = torch.relu(self.bn1(self.conv1(x)))
         x = torch.relu(self.bn2(self.conv2(x)))
         x = torch.relu(self.bn3(self.conv3(x)))
@@ -44,20 +58,51 @@ class ChessNetwork(nn.Module):
         for block in self.res_blocks:
             x = block(x)
 
-        # Policy head
+        # ----------------- Policy -----------------
         policy = torch.relu(self.policy_bn(self.policy_conv(x)))
         policy = policy.flatten(1)
-        policy = self.policy_fc(policy)
-        # NOTE: No softmax here — use raw logits for CrossEntropyLoss
+        policy = self.policy_fc(policy)  # logits (not softmaxed)
 
-        # Value head
-        value = torch.relu(self.value_conv(x))
+        # ----------------- Value ------------------
+        value = torch.relu(self.value_bn(self.value_conv(x)))
         value = value.view(value.size(0), -1)
         value = torch.relu(self.value_fc1_bn(self.value_fc1(value)))
         value = self.dropout(value)
-        value = torch.tanh(self.value_fc2(value))  # Output in [-1, 1]
+        value = torch.tanh(self.value_fc2(value))  # range [-1,1]
 
         return policy, value
+
+
+    # =====================
+    # 🔥 Optimization Mode
+    # =====================
+    def enable_fast_inference(self):
+        """
+        Optimizes the model for repeated inference during MCTS:
+        - Disables dropout
+        - Freezes BatchNorm statistics
+        - Compiles the network (if supported)
+        """
+        if self.optimized:
+            return self
+        
+        # Freeze dropout + BN stats
+        for layer in self.modules():
+            if isinstance(layer, nn.BatchNorm2d) or isinstance(layer, nn.BatchNorm1d):
+                layer.eval()
+                layer.track_running_stats = False
+            if isinstance(layer, nn.Dropout):
+                layer.p = 0.0  # disable dropout entirely
+
+        # Try torch_compile (PyTorch 2.0+). Safe fallback.
+        try:
+            self = torch.compile(self)
+        except Exception:
+            pass
+
+        self.optimized = True
+        return self
+
 
 
 class ResidualBlock(nn.Module):
@@ -69,46 +114,41 @@ class ResidualBlock(nn.Module):
         self.bn2 = nn.BatchNorm2d(channels)
 
     def forward(self, x):
-        residual = x
+        identity = x
         out = torch.relu(self.bn1(self.conv1(x)))
         out = self.bn2(self.conv2(out))
-        out += residual
-        out = torch.relu(out)
-        return out
+        return torch.relu(out + identity)
 
 
+# ==========================
+# Legal move post-processing
+# ==========================
 def network_output_to_move_probs(board, policy_output):
     """
-    Convert raw logits into a normalized probability distribution
-    over legal moves.
+    Convert logits → softmax → legal move probability dictionary.
     """
 
-    # --- Convert input to numpy safely ---
+    # Ensure policy is numpy
     if isinstance(policy_output, torch.Tensor):
         logits = policy_output.detach().cpu().numpy()
     else:
         logits = np.array(policy_output)
 
-    # --- Softmax over all logits ---
-    exp_logits = np.exp(logits - np.max(logits))  # numerically stable
+    # Softmax over full move space (4096 indexes)
+    exp_logits = np.exp(logits - np.max(logits))
     softmax_probs = exp_logits / np.sum(exp_logits)
 
     legal_moves = list(board.legal_moves)
+    move_to_idx = {m: m.from_square * 64 + m.to_square for m in legal_moves}
 
-    # Map move → index in policy vector
-    move_to_idx = {m: (m.from_square * 64 + m.to_square) for m in legal_moves}
-
-    # Extract only legal move probabilities
     legal_move_probs = {m: softmax_probs[idx] for m, idx in move_to_idx.items()}
 
-    # Normalize so legal move probabilities sum to 1
-    total = sum(legal_move_probs.values())
-
-    if total > 0:
-        legal_move_probs = {m: p / total for m, p in legal_move_probs.items()}
+    # Renormalize over legal moves
+    S = sum(legal_move_probs.values())
+    if S > 0:
+        legal_move_probs = {m: p / S for m, p in legal_move_probs.items()}
     else:
-        # Fallback uniform distribution (should never happen but safe)
-        uniform = 1 / len(legal_moves)
-        legal_move_probs = {m: uniform for m in legal_moves}
+        # Rare fallback: uniform random
+        legal_move_probs = {m: 1 / len(legal_moves) for m in legal_moves}
 
     return legal_move_probs
