@@ -99,7 +99,7 @@ def classify_game_phase(board):
 ###########################################
 # PGN LOADER (fast)
 ###########################################
-def load_pgn_games(pgn_folder, max_games_per_file=500):
+def load_pgn_games(pgn_folder, max_games_per_file=5000):
     games = []
     if not os.path.isdir(pgn_folder):
         print(f"❌ PGN folder not found: {pgn_folder}")
