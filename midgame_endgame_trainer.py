@@ -18,7 +18,8 @@ from network_architecture import ChessNetwork
 ###########################################
 # CONFIG
 ###########################################
-STOCKFISH_PATH = "dist/stockfish.exe"
+STOCKFISH_PATH = "dist/stockfish-ubuntu-x86-64-avx2"
+
 BASE_DEPTH = 6          # adaptive depth (will increase for endgames)
 CP_SCALE = 300
 USE_MIXED_PRECISION = True
